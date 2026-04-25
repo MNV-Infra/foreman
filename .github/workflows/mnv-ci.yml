@@ -1,0 +1,344 @@
+name: "mnv: CI"
+
+on:
+  workflow_dispatch:
+    inputs:
+      callback_url:
+        description: Optional Foreman callback base URL
+        type: string
+        default: ""
+      callback_token:
+        description: Optional Foreman callback bearer token
+        type: string
+        default: ""
+  workflow_call:
+    inputs:
+      callback_url:
+        description: Optional Foreman callback base URL
+        required: false
+        type: string
+        default: ""
+      callback_token:
+        description: Optional Foreman callback bearer token
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: mnv-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  callback-start:
+    name: "Callback Start"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      callback_url: ${{ steps.prepare.outputs.callback_url }}
+      pipeline_id: ${{ steps.prepare.outputs.pipeline_id }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Prepare callback destination
+        id: prepare
+        uses: ./.github/actions/foreman-prepare-callback
+        with:
+          callback_url: ${{ inputs.callback_url || github.event.inputs.callback_url || '' }}
+          callback_token: ${{ inputs.callback_token || github.event.inputs.callback_token || '' }}
+          foreman_base_url: ${{ vars.FOREMAN_BASE_URL || 'https://builds.projecttick.net' }}
+          foreman_api_token: ${{ secrets.FOREMAN_API_TOKEN || '' }}
+          repository: ${{ github.repository }}
+          workflow_name: ${{ github.workflow }}
+          event_name: ${{ github.event_name }}
+          ref: ${{ github.ref }}
+          sha: ${{ github.sha }}
+          pr_number: ${{ github.event.inputs.pr-number || '' }}
+          pr_head_sha: ${{ github.event.inputs.pr-head-sha || '' }}
+          pr_target_branch: ${{ github.event.inputs.base-ref || '' }}
+
+      - name: Report workflow run URL
+        uses: ./.github/actions/foreman-send-callback
+        with:
+          callback_url: ${{ steps.prepare.outputs.callback_url }}
+          callback_token: ${{ steps.prepare.outputs.callback_token }}
+          endpoint: log_url
+          payload_json: ${{ format('{{"log_url":"{0}/{1}/actions/runs/{2}"}}', github.server_url, github.repository, github.run_id) }}
+
+  linux:
+    needs: callback-start
+    runs-on: ${{ matrix.architecture == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+
+    env:
+      CC: ${{ matrix.compiler }}
+      GCC_VER: 14
+      CLANG_VER: 21
+      TEST: test
+      SRCDIR: ./src
+      LEAK_CFLAGS: -DEXITFREE
+      LOG_DIR: ${{ github.workspace }}/logs
+      TERM: xterm
+      DISPLAY: ':99'
+      DEBIAN_FRONTEND: noninteractive
+
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [tiny, normal, huge]
+        compiler: [clang, gcc]
+        extra: [[]]
+        architecture: [native]
+        include:
+          - features: tiny
+            compiler: clang
+            extra: [nogui]
+          - features: tiny
+            compiler: gcc
+            extra: [nogui]
+          - features: tiny
+            compiler: gcc
+            extra: [nogui]
+            architecture: arm64
+          - features: huge
+            coverage: true
+          - features: huge
+            compiler: clang
+            interface: dynamic
+            python3: stable-abi
+          - features: huge
+            compiler: gcc
+            coverage: true
+            interface: dynamic
+            extra: [uchar, testgui]
+          - features: huge
+            compiler: gcc
+            coverage: true
+            extra: [unittests]
+          - features: huge
+            compiler: gcc
+            coverage: true
+            extra: [unittests]
+            architecture: arm64
+          - features: normal
+            compiler: gcc
+            extra: [vimtags, proto, codestyle]
+
+    defaults:
+      run:
+        working-directory: mnv
+
+    steps:
+      - name: Checkout repository
+        uses: Project-Tick/Project-Tick/.github/actions/source-checkout@master
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y \
+            autoconf \
+            clang \
+            lcov \
+            gettext \
+            libcanberra-dev \
+            libperl-dev \
+            python3-dev \
+            liblua5.4-dev \
+            lua5.4 \
+            ruby-dev \
+            tcl-dev \
+            libsodium-dev \
+            libgtk-3-dev \
+            desktop-file-utils \
+            libtool-bin
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.features }}" = "tiny" ]; then
+            ./configure --with-features=tiny --disable-gui
+          elif [ "${{ matrix.features }}" = "normal" ]; then
+            ./configure --with-features=normal --disable-gui
+          else
+            ./configure --with-features=huge \
+              --enable-perlinterp \
+              --enable-pythoninterp \
+              --enable-python3interp \
+              --enable-rubyinterp \
+              --enable-luainterp \
+              --enable-tclinterp \
+              --enable-gui=gtk3
+          fi
+          make -j"$(nproc)"
+
+      - name: Test
+        timeout-minutes: 25
+        run: |
+          make "$TEST"
+
+      - name: Upload test artifacts
+        if: failure()
+        uses: ./.github/actions/mnv/test_artifacts
+
+  cmake-linux:
+    needs: callback-start
+    runs-on: ubuntu-24.04
+
+    env:
+      CC: ${{ matrix.compiler }}
+      CXX: ${{ matrix.compiler == 'clang' && 'clang++' || 'g++' }}
+      DEBIAN_FRONTEND: noninteractive
+      TERM: xterm
+      DISPLAY: ':99'
+
+    strategy:
+      fail-fast: false
+      matrix:
+        preset:
+          - default
+          - minimal
+          - normal
+          - all-interp
+          - all-interp-static
+          - lua-only
+          - python3-only
+          - ruby-only
+          - perl-only
+          - tcl-only
+          - nogui
+          - gtk3
+          - sanitize
+          - profile
+          - full-debug
+        compiler: [gcc, clang]
+
+    defaults:
+      run:
+        working-directory: mnv
+
+    steps:
+      - name: Checkout repository
+        uses: Project-Tick/Project-Tick/.github/actions/source-checkout@master
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y \
+            cmake \
+            clang \
+            gettext \
+            libcanberra-dev \
+            libperl-dev \
+            python3-dev \
+            liblua5.4-dev \
+            lua5.4 \
+            ruby-dev \
+            tcl-dev \
+            libsodium-dev \
+            libgtk-3-dev \
+            libxt-dev \
+            desktop-file-utils \
+            libtool-bin
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} -- -j"$(nproc)"
+
+      - name: Start virtual display
+        if: contains(fromJSON('["default", "all-interp", "full-debug"]'), matrix.preset)
+        run: Xvfb :99 -screen 0 1024x768x24 &
+
+      - name: Test
+        if: contains(fromJSON('["default", "all-interp", "full-debug"]'), matrix.preset)
+        timeout-minutes: 120
+        run: ctest --preset ${{ matrix.preset }} --output-on-failure --extra-verbose
+
+  macos:
+    needs: callback-start
+    runs-on: ${{ matrix.runner }}
+
+    env:
+      CC: clang
+      TEST: test
+      SRCDIR: ./src
+      LEAK_CFLAGS: -DEXITFREE
+      TERM: xterm
+
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [tiny, normal, huge]
+        runner: [macos-15]
+
+    defaults:
+      run:
+        working-directory: mnv
+
+    steps:
+      - name: Checkout repository
+        uses: Project-Tick/Project-Tick/.github/actions/source-checkout@master
+
+      - name: Install dependencies
+        run: brew install lua libtool
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.features }}" = "tiny" ]; then
+            ./configure --with-features=tiny --disable-gui
+          elif [ "${{ matrix.features }}" = "normal" ]; then
+            ./configure --with-features=normal --disable-gui
+          else
+            ./configure --with-features=huge \
+              --enable-python3interp \
+              --enable-rubyinterp \
+              --enable-luainterp \
+              --enable-tclinterp
+          fi
+          make -j"$(sysctl -n hw.logicalcpu)"
+
+      - name: Test
+        timeout-minutes: 25
+        run: |
+          make "$TEST"
+
+  callback-status:
+    name: "Callback Status"
+    if: always()
+    needs:
+      - callback-start
+      - linux
+      - cmake-linux
+      - macos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve final workflow status
+        id: resolve-status
+        shell: bash
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+
+          status="success"
+          if jq -e 'to_entries[] | select(.key != "callback-start" and .value.result == "failure")' <<< "$NEEDS_JSON" >/dev/null; then
+            status="failure"
+          elif jq -e 'to_entries[] | select(.key != "callback-start" and .value.result == "cancelled")' <<< "$NEEDS_JSON" >/dev/null; then
+            status="cancelled"
+          fi
+
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Report final workflow status
+        uses: ./.github/actions/foreman-send-callback
+        with:
+          callback_url: ${{ needs.callback-start.outputs.callback_url }}
+          pipeline_id: ${{ needs.callback-start.outputs.pipeline_id }}
+          foreman_base_url: ${{ vars.FOREMAN_BASE_URL || 'https://builds.projecttick.net' }}
+          foreman_api_token: ${{ secrets.FOREMAN_API_TOKEN || '' }}
+          endpoint: status
+          payload_json: ${{ format('{{"status":"{0}"}}', steps.resolve-status.outputs.status) }}
