@@ -2,15 +2,13 @@ name: "Uppfinna Forge: Gitaly Upstream Sync"
 
 # Automated upstream sync for the UppFinna Gitaly fork.
 #
-#   GitLab Gitaly upstream
-#           |
-#   checkout upstream (+ the fork, for the sync tool)
-#           |
-#   build & run tools/sync
-#           |
-#   staging-<UPSTREAM_COMMIT_SHA> branch
-#           |
-#   commit -> push -> merge request against master
+#   GitLab Gitaly upstream            UppFinna Gitaly fork (master)
+#            |                                    |
+#     checkout upstream                    checkout the fork
+#            |                                    |
+#   build and run tools/sync  -- mirror -->  staging-<sha>, cut from master
+#   (patches the upstream tree)                   |
+#                                      commit -> push -> merge request
 #
 # The whole upstream-to-fork transformation lives in the Go program at
 # `tools/sync` of the Gitaly source project, NOT in this file. The workflow
@@ -28,8 +26,19 @@ name: "Uppfinna Forge: Gitaly Upstream Sync"
 # Two branches are maintained on the fork:
 #   - `upstream`: a plain mirror of the upstream ref. It never carries a commit
 #     of our own and is force-updated on every run.
-#   - `staging-<short sha>`: the mirrored upstream commit plus a single sync
-#     commit holding the transformation. This is the merge request source.
+#   - `staging-<short sha>`: cut from the merge request target branch, with a
+#     single commit that mirrors the patched upstream tree onto it.
+#
+# The staging branch is deliberately cut from the target branch and not from
+# the upstream commit. A branch rooted in upstream shares no history with the
+# fork, so its merge request would show every patched file as a conflicting
+# change. Rooted in the target branch, the diff is exactly the upstream delta
+# and the merge request fast-forwards.
+#
+# The consequence is that everything the fork wants to keep must either be a
+# path the tool never mirrors (`--keep`, this tool itself for instance) or a
+# patch in `tools/sync/patches/`. Hand edits to upstream files on master are
+# mirrored away by the next sync.
 #
 # Checkout uses the same `Project-Tick-Infrastructure/checkout@v5` action every
 # other workflow here uses (see gitaly-ci.yml), including for the upstream
@@ -150,18 +159,21 @@ jobs:
             echo "has_token=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Checkout UppFinna Gitaly (sync tool)
+      # This checkout is both the source of the sync tool and the merge request
+      # source: the staging branch is cut from it, so it needs full history.
+      - name: Checkout UppFinna Gitaly (sync tool and staging base)
         uses: Project-Tick-Infrastructure/checkout@v5
         with:
           path: uppfinna
+          fetch-depth: 0
           ref: ${{ env.TARGET_BRANCH }}
           source-repository: ${{ env.FORK_REPOSITORY }}
           source-auth-token: ${{ env.GITLAB_TOKEN }}
           source-auth-username: ${{ env.GITLAB_USERNAME }}
           show-progress: 'false'
 
-      # Full history: the mirror branch and the staging branch are pushed from
-      # this checkout, so a shallow clone would truncate the fork's history.
+      # Full history: the `upstream` mirror branch is pushed from this
+      # checkout, and pushing a shallow clone would truncate it.
       - name: Checkout upstream Gitaly
         uses: Project-Tick-Infrastructure/checkout@v5
         with:
@@ -181,55 +193,73 @@ jobs:
           set -euo pipefail
           "${RUNNER_TEMP}/gitaly-upstream-sync" \
             --source upstream \
+            --target uppfinna \
             --commit-message-file "${RUNNER_TEMP}/gitaly-sync-commit-message.txt" \
             --output "${GITHUB_OUTPUT}"
 
-      - name: Commit transformed tree
-        working-directory: upstream
+      - name: Commit onto the staging branch
+        id: commit
+        working-directory: uppfinna
         env:
           BRANCH: ${{ steps.sync.outputs.branch }}
+          UPSTREAM_SHORT_SHA: ${{ steps.sync.outputs.upstream_short_sha }}
         run: |
           set -euo pipefail
           git config user.name "${GIT_USER_NAME}"
           git config user.email "${GIT_USER_EMAIL}"
+          # Cut from the target branch, so the merge request diff is the
+          # upstream delta rather than two unrelated trees.
           git switch --create "${BRANCH}"
           git add --all
           if git diff --cached --quiet; then
-            echo "::notice::Upstream tree needed no transformation; staging it unchanged."
+            echo "::notice::${TARGET_BRANCH} already matches upstream ${UPSTREAM_SHORT_SHA}; nothing to propose."
+            echo "committed=false" >> "$GITHUB_OUTPUT"
           else
             git commit --quiet --file "${RUNNER_TEMP}/gitaly-sync-commit-message.txt"
+            echo "committed=true" >> "$GITHUB_OUTPUT"
+            git --no-pager show --stat --oneline HEAD | head -20
           fi
-          git --no-pager log --oneline -1
 
-      - name: Push mirror and staging branch
+      - name: Push upstream mirror
         if: steps.credentials.outputs.has_token == 'true'
         working-directory: upstream
         env:
-          BRANCH: ${{ steps.sync.outputs.branch }}
           UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
         run: |
           set -euo pipefail
-          git remote add fork "https://${GITLAB_USERNAME}:${GITLAB_TOKEN}@${FORK_REPOSITORY#https://}"
-          git push --force fork "${UPSTREAM_SHA}:refs/heads/${MIRROR_BRANCH}"
-          git push --force fork "HEAD:refs/heads/${BRANCH}"
+          git push --force \
+            "https://${GITLAB_USERNAME}:${GITLAB_TOKEN}@${FORK_REPOSITORY#https://}" \
+            "${UPSTREAM_SHA}:refs/heads/${MIRROR_BRANCH}"
+
+      - name: Push staging branch
+        if: steps.credentials.outputs.has_token == 'true' && steps.commit.outputs.committed == 'true'
+        working-directory: uppfinna
+        env:
+          BRANCH: ${{ steps.sync.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git push --force \
+            "https://${GITLAB_USERNAME}:${GITLAB_TOKEN}@${FORK_REPOSITORY#https://}" \
+            "HEAD:refs/heads/${BRANCH}"
 
       - name: Create merge request
-        if: steps.credentials.outputs.has_token == 'true'
+        if: steps.credentials.outputs.has_token == 'true' && steps.commit.outputs.committed == 'true'
         env:
           BRANCH: ${{ steps.sync.outputs.branch }}
           UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
           UPSTREAM_SHORT_SHA: ${{ steps.sync.outputs.upstream_short_sha }}
           APPLIED_PATCHES: ${{ steps.sync.outputs.patches }}
           CHANGED_FILES: ${{ steps.sync.outputs.changed_files }}
+          MIRRORED_FILES: ${{ steps.sync.outputs.mirrored_files }}
           RUN_URL: ${{ format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
         run: |
           set -euo pipefail
 
           project="$(jq -rn --arg path "${FORK_PROJECT}" '$path|@uri')"
-          description="$(printf '%s\n\n- Upstream repository: %s\n- Upstream ref: %s\n- Upstream commit: %s\n- Applied patches: %s\n- Rewritten files: %s\n- Workflow run: %s\n' \
+          description="$(printf '%s\n\n- Upstream repository: %s\n- Upstream ref: %s\n- Upstream commit: %s\n- Applied patches: %s\n- Patched files: %s\n- Mirrored paths: %s\n- Workflow run: %s\n' \
             "Automated sync of upstream Gitaly into the UppFinna fork." \
             "${UPSTREAM_REPOSITORY}" "${UPSTREAM_REF}" "${UPSTREAM_SHA}" \
-            "${APPLIED_PATCHES:-none}" "${CHANGED_FILES}" "${RUN_URL}")"
+            "${APPLIED_PATCHES:-none}" "${CHANGED_FILES}" "${MIRRORED_FILES}" "${RUN_URL}")"
           payload="$(jq -nc \
             --arg source "${BRANCH}" \
             --arg target "${TARGET_BRANCH}" \
