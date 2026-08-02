@@ -2,13 +2,16 @@ name: "Uppfinna Forge: Gitaly Upstream Sync"
 
 # Automated upstream sync for the UppFinna Gitaly fork.
 #
-#   GitLab Gitaly upstream            UppFinna Gitaly fork (master)
-#            |                                    |
-#     checkout upstream                    checkout the fork
-#            |                                    |
-#   build and run tools/sync  -- mirror -->  staging-<sha>, cut from master
-#   (patches the upstream tree)                   |
-#                                      commit -> push -> merge request
+#   GitLab Gitaly upstream                UppFinna Gitaly fork
+#            |                                     |
+#     checkout upstream                     checkout master
+#            |                                     |
+#   build and run tools/sync                       |
+#   (patches the upstream tree)                    |
+#            |                                     |
+#      patched-upstream  ---- three-way merge ---> staging-<sha>
+#      (vendor branch)         (base: previous            |
+#                               vendor commit)   push -> merge request
 #
 # The whole upstream-to-fork transformation lives in the Go program at
 # `tools/sync` of the Gitaly source project, NOT in this file. The workflow
@@ -23,22 +26,28 @@ name: "Uppfinna Forge: Gitaly Upstream Sync"
 # protobuf compiler plugins on first use. Pass `--skip protogen` to the tool if
 # a run must stay offline; the bindings then keep upstream's go_package.
 #
-# Two branches are maintained on the fork:
+# Three branches are maintained on the fork:
 #   - `upstream`: a plain mirror of the upstream ref. It never carries a commit
 #     of our own and is force-updated on every run.
-#   - `staging-<short sha>`: cut from the merge request target branch, with a
-#     single commit that mirrors the patched upstream tree onto it.
+#   - `patched-upstream`: the vendor branch. Nothing but the patched upstream
+#     tree, one commit per synced upstream commit, plus a `refs/upstream-sync/
+#     <upstream sha>` ref per commit so any of them can be found again.
+#   - `staging-<short sha>`: the merge request source. A single commit on top
+#     of the target branch holding the three-way merge of the target branch
+#     with the new vendor tree.
 #
-# The staging branch is deliberately cut from the target branch and not from
-# the upstream commit. A branch rooted in upstream shares no history with the
-# fork, so its merge request would show every patched file as a conflicting
-# change. Rooted in the target branch, the diff is exactly the upstream delta
-# and the merge request fast-forwards.
+# The merge base is the vendor commit the target branch last received, which
+# the sync records in `.upstream-sync` inside the patched tree. That is what
+# keeps the merge request down to the upstream delta and, more importantly,
+# what preserves the fork's own work: files only the fork has are in neither
+# vendor tree, so the merge never touches them, and fork edits inside upstream
+# files merge line by line. A genuine overlap, both sides changing the same
+# lines, is reported as a conflict and left to a human.
 #
-# The consequence is that everything the fork wants to keep must either be a
-# path the tool never mirrors (`--keep`, this tool itself for instance) or a
-# patch in `tools/sync/patches/`. Hand edits to upstream files on master are
-# mirrored away by the next sync.
+# Bootstrapping, once: run the workflow with `upstream-ref` set to the upstream
+# commit the fork was last built from. It creates the vendor branch without
+# opening a merge request. Then commit that same upstream commit ID into
+# `.upstream-sync` on the target branch. Every later run is fully automatic.
 #
 # Checkout uses the same `Project-Tick-Infrastructure/checkout@v5` action every
 # other workflow here uses (see gitaly-ci.yml), including for the upstream
@@ -123,6 +132,8 @@ jobs:
       FORK_PROJECT: ${{ vars.GITALY_FORK_PROJECT || 'project-tick/uppfinna/forge/gitaly' }}
       TARGET_BRANCH: ${{ inputs.target-branch || vars.GITALY_FORK_DEFAULT_BRANCH || 'master' }}
       MIRROR_BRANCH: ${{ vars.GITALY_MIRROR_BRANCH || 'upstream' }}
+      VENDOR_BRANCH: ${{ vars.GITALY_VENDOR_BRANCH || 'patched-upstream' }}
+      MARKER_FILE: ${{ vars.GITALY_MARKER_FILE || '.upstream-sync' }}
       API_V4_URL: ${{ vars.PT_API_V4_URL || 'https://projecttick.org/api/v4' }}
       GITLAB_USERNAME: ${{ vars.PT_GITLAB_SOURCE_USERNAME || 'oauth2' }}
       GITLAB_TOKEN: ${{ secrets.PT_GITLAB_SYNC_TOKEN || secrets.PT_GITLAB_SOURCE_TOKEN || '' }}
@@ -187,6 +198,35 @@ jobs:
         working-directory: uppfinna/tools/sync
         run: go build -o "${RUNNER_TEMP}/gitaly-upstream-sync" .
 
+      # The vendor branch carries nothing but the patched upstream tree. It is
+      # the "theirs" side of the three-way merge, and the tree it had at the
+      # previous sync is the merge base, which is what keeps the fork's own
+      # work out of the diff.
+      - name: Check out the vendor branch
+        id: vendor
+        working-directory: uppfinna
+        run: |
+          set -euo pipefail
+          git config user.name "${GIT_USER_NAME}"
+          git config user.email "${GIT_USER_EMAIL}"
+
+          # The checkout action leaves a detached HEAD at the target branch.
+          echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+          if [[ -n "${GITLAB_TOKEN:-}" ]]; then
+            git remote add fork "https://${GITLAB_USERNAME}:${GITLAB_TOKEN}@${FORK_REPOSITORY#https://}"
+            git fetch --no-tags --quiet fork \
+              "+refs/heads/${VENDOR_BRANCH}:refs/heads/${VENDOR_BRANCH}" \
+              "+refs/upstream-sync/*:refs/upstream-sync/*" || true
+          fi
+
+          if git rev-parse --verify --quiet "refs/heads/${VENDOR_BRANCH}" >/dev/null; then
+            git switch --quiet "${VENDOR_BRANCH}"
+          else
+            echo "::notice::${VENDOR_BRANCH} does not exist yet; this run bootstraps it."
+            git switch --quiet --orphan "${VENDOR_BRANCH}"
+          fi
+
       - name: Run sync tool
         id: sync
         run: |
@@ -194,42 +234,102 @@ jobs:
           "${RUNNER_TEMP}/gitaly-upstream-sync" \
             --source upstream \
             --target uppfinna \
+            --keep _build \
             --commit-message-file "${RUNNER_TEMP}/gitaly-sync-commit-message.txt" \
             --output "${GITHUB_OUTPUT}"
 
-      - name: Commit onto the staging branch
+      - name: Commit the vendor branch
+        id: vendor-commit
+        working-directory: uppfinna
+        env:
+          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+          UPSTREAM_SHORT_SHA: ${{ steps.sync.outputs.upstream_short_sha }}
+        run: |
+          set -euo pipefail
+          git add --all
+
+          if git rev-parse --verify --quiet HEAD >/dev/null && git diff --cached --quiet; then
+            echo "::notice::${VENDOR_BRANCH} already carries upstream ${UPSTREAM_SHORT_SHA}."
+          else
+            # The trailer is what `refs/upstream-sync/<sha>` mirrors, and what
+            # makes a vendor commit traceable back to its upstream commit.
+            {
+              cat "${RUNNER_TEMP}/gitaly-sync-commit-message.txt"
+              echo ""
+              echo "Upstream-commit: ${UPSTREAM_SHA}"
+            } > "${RUNNER_TEMP}/vendor-commit-message.txt"
+            git commit --quiet --file "${RUNNER_TEMP}/vendor-commit-message.txt"
+          fi
+
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build the staging commit
         id: commit
         working-directory: uppfinna
         env:
+          BASE: ${{ steps.vendor.outputs.base }}
+          VENDOR_COMMIT: ${{ steps.vendor-commit.outputs.commit }}
           BRANCH: ${{ steps.sync.outputs.branch }}
           UPSTREAM_SHORT_SHA: ${{ steps.sync.outputs.upstream_short_sha }}
         run: |
           set -euo pipefail
-          git config user.name "${GIT_USER_NAME}"
-          git config user.email "${GIT_USER_EMAIL}"
-          # Cut from the target branch, so the merge request diff is the
-          # upstream delta rather than two unrelated trees.
-          git switch --create "${BRANCH}"
-          git add --all
-          if git diff --cached --quiet; then
-            echo "::notice::${TARGET_BRANCH} already matches upstream ${UPSTREAM_SHORT_SHA}; nothing to propose."
-            echo "committed=false" >> "$GITHUB_OUTPUT"
-          else
-            git commit --quiet --file "${RUNNER_TEMP}/gitaly-sync-commit-message.txt"
-            echo "committed=true" >> "$GITHUB_OUTPUT"
-            git --no-pager show --stat --oneline HEAD | head -20
+          echo "committed=false" >> "$GITHUB_OUTPUT"
+
+          # The marker travels with the patched tree, so the target branch
+          # records the upstream commit it last received, and the vendor commit
+          # of that upstream commit is the merge base.
+          previous="$(git show "${BASE}:${MARKER_FILE}" 2>/dev/null | tr -d '[:space:]' || true)"
+          merge_base=""
+          if [[ -n "$previous" ]]; then
+            merge_base="$(git rev-parse --verify --quiet "refs/upstream-sync/${previous}" || true)"
           fi
 
-      - name: Push upstream mirror
+          if [[ -z "$merge_base" ]]; then
+            echo "::notice::${TARGET_BRANCH} records no vendored upstream commit yet. Pushing ${VENDOR_BRANCH} only; commit ${MARKER_FILE} on ${TARGET_BRANCH} with the upstream commit it was forked from to enable merge requests."
+            exit 0
+          fi
+
+          if [[ "$merge_base" == "$VENDOR_COMMIT" ]]; then
+            echo "::notice::${TARGET_BRANCH} is already synced with upstream ${UPSTREAM_SHORT_SHA}."
+            exit 0
+          fi
+
+          # Three-way merge of the target branch with the new vendor tree,
+          # based on the vendor tree it last received. Files only the fork has
+          # are in neither vendor tree, so the merge leaves them alone, and
+          # fork edits inside upstream files survive line by line.
+          if ! tree="$(git merge-tree --write-tree --merge-base="$merge_base" "$BASE" "$VENDOR_COMMIT")"; then
+            echo "::error::Upstream ${UPSTREAM_SHORT_SHA} conflicts with ${TARGET_BRANCH} and needs a manual merge."
+            printf '%s\n' "$tree"
+            exit 1
+          fi
+
+          if [[ "$tree" == "$(git rev-parse "${BASE}^{tree}")" ]]; then
+            echo "::notice::Upstream ${UPSTREAM_SHORT_SHA} changes nothing on ${TARGET_BRANCH}."
+            exit 0
+          fi
+
+          # One commit on top of the target branch, so the merge request holds
+          # a single commit and squashes to exactly that.
+          commit="$(git commit-tree "$tree" -p "${BASE}" -F "${RUNNER_TEMP}/gitaly-sync-commit-message.txt")"
+          git branch --force "${BRANCH}" "$commit"
+
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+          git --no-pager show --oneline --shortstat "$commit"
+
+      - name: Push upstream mirror and vendor branch
         if: steps.credentials.outputs.has_token == 'true'
-        working-directory: upstream
         env:
           UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+          VENDOR_COMMIT: ${{ steps.vendor-commit.outputs.commit }}
         run: |
           set -euo pipefail
-          git push --force \
+          git -C upstream push --force \
             "https://${GITLAB_USERNAME}:${GITLAB_TOKEN}@${FORK_REPOSITORY#https://}" \
             "${UPSTREAM_SHA}:refs/heads/${MIRROR_BRANCH}"
+          git -C uppfinna push --force fork \
+            "${VENDOR_COMMIT}:refs/heads/${VENDOR_BRANCH}" \
+            "${VENDOR_COMMIT}:refs/upstream-sync/${UPSTREAM_SHA}"
 
       - name: Push staging branch
         if: steps.credentials.outputs.has_token == 'true' && steps.commit.outputs.committed == 'true'
@@ -238,9 +338,7 @@ jobs:
           BRANCH: ${{ steps.sync.outputs.branch }}
         run: |
           set -euo pipefail
-          git push --force \
-            "https://${GITLAB_USERNAME}:${GITLAB_TOKEN}@${FORK_REPOSITORY#https://}" \
-            "HEAD:refs/heads/${BRANCH}"
+          git push --force fork "refs/heads/${BRANCH}:refs/heads/${BRANCH}"
 
       - name: Create merge request
         if: steps.credentials.outputs.has_token == 'true' && steps.commit.outputs.committed == 'true'
@@ -270,7 +368,8 @@ jobs:
               target_branch: $target,
               title: $title,
               description: $description,
-              remove_source_branch: true
+              remove_source_branch: true,
+              squash: true
             }')"
 
           if response="$(curl \
