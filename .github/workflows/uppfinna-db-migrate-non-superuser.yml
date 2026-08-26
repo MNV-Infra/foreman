@@ -53,7 +53,7 @@ jobs:
       rediscluster:
         image: registry.gitlab.com/gitlab-org/gitlab-build-images:redis-cluster-7.0.11
       redis:
-        image: redis:7.2-alpine
+        image: redis:8.10-alpine@sha256:becdda6c7f4b3fb42e42fd7f120bbf5c54c4caaaf16f26da24e4563d2c1f0576
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 10s
