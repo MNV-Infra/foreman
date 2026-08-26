@@ -25,13 +25,13 @@ jobs:
     steps:
       - name: Start log collector
         if: inputs.foreman-pipeline-id != ''
-        uses: Project-Tick/Project-Tick/.github/actions/log-collector@master
+        uses: Project-Tick/Project-Tick/.github/actions/log-collector@6b3c10bbfe55fccf16d4959d76d0674226874c0a # master
         with:
           pipeline_id: ${{ inputs.foreman-pipeline-id }}
           foreman_api_token: ${{ secrets.FOREMAN_API_TOKEN }}
           job_name: ${{ github.job }}
       - name: Checkout repository
-        uses: Project-Tick-Infrastructure/checkout@v5
+        uses: Project-Tick-Infrastructure/checkout@22f699d1b88f4f7260eb5633e8e31670263e3cbc # v5
         with:
           source-repository: ${{ inputs.source-repository || '' }}
           show-progress: 'false'
@@ -77,13 +77,13 @@ jobs:
     steps:
       - name: Start log collector
         if: inputs.foreman-pipeline-id != ''
-        uses: Project-Tick/Project-Tick/.github/actions/log-collector@master
+        uses: Project-Tick/Project-Tick/.github/actions/log-collector@6b3c10bbfe55fccf16d4959d76d0674226874c0a # master
         with:
           pipeline_id: ${{ inputs.foreman-pipeline-id }}
           foreman_api_token: ${{ secrets.FOREMAN_API_TOKEN }}
           job_name: ${{ github.job }}
       - name: Checkout repository
-        uses: Project-Tick-Infrastructure/checkout@v5
+        uses: Project-Tick-Infrastructure/checkout@22f699d1b88f4f7260eb5633e8e31670263e3cbc # v5
         with:
           source-repository: ${{ inputs.source-repository || '' }}
           show-progress: 'false'
