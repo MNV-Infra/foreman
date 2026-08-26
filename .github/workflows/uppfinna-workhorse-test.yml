@@ -42,7 +42,7 @@ jobs:
       contents: read
     services:
       redis:
-        image: redis:7.2-alpine
+        image: redis:7.4-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 10s
